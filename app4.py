@@ -1,6 +1,6 @@
-# app4.py  -- Advanced RAG Q&A (upgraded)
-# Requirements (suggested):
-# pip install streamlit langchain-groq langchain-core langchain-community langchain-text-splitters langchain-chroma sentence-transformers==2.2.2 scikit-learn python-docx python-dotenv
+# app4.py  -- Advanced RAG Q&A (deployment friendly)
+# Requirements:
+# pip install streamlit langchain-groq langchain-core langchain-community langchain-text-splitters langchain-chroma scikit-learn python-docx python-dotenv pymupdf
 
 import os
 import tempfile
@@ -13,30 +13,26 @@ import json
 from datetime import datetime
 from dotenv import load_dotenv
 
-# LangChain / embedding / vectorstore imports
+# LangChain imports
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.output_parsers import StrOutputParser
 
-# Try different embedding approaches
+# Use OpenAI embeddings instead of sentence-transformers
 try:
-    # First try: use HuggingFaceEmbeddings with a simpler model
-    from langchain_community.embeddings import HuggingFaceEmbeddings
-    EMBEDDINGS_AVAILABLE = True
-except Exception as e:
-    st.warning(f"HuggingFaceEmbeddings not available: {e}")
-    EMBEDDINGS_AVAILABLE = False
+    from langchain_openai import OpenAIEmbeddings
+    OPENAI_EMBEDDINGS_AVAILABLE = True
+except Exception:
+    OPENAI_EMBEDDINGS_AVAILABLE = False
 
 try:
     from langchain_chroma import Chroma
     CHROMA_AVAILABLE = True
-except Exception as e:
-    st.warning(f"Chroma not available: {e}")
+except Exception:
     CHROMA_AVAILABLE = False
-
-from langchain_core.output_parsers import StrOutputParser
 
 # Optional imports
 try:
@@ -58,7 +54,7 @@ load_dotenv()
 # Streamlit basic config / UI
 # -----------------------------
 st.set_page_config(page_title="Advanced RAG Q&A", page_icon="📚", layout="wide")
-st.title("🚀 Advanced RAG Q&A — Upgraded")
+st.title("🚀 Advanced RAG Q&A — Deployment Friendly")
 
 # Debug toggle
 DEBUG = st.sidebar.checkbox("Debug mode (console logs)", False)
@@ -106,27 +102,25 @@ def load_chat_history(session_id):
 with st.sidebar:
     st.header("⚙️ Configuration")
     session_id = st.text_input("Session ID", value=os.getenv("DEFAULT_SESSION_ID", "default_session"))
-    api_key_input = st.text_input("Groq API Key", type="password")
-    model_choice = st.selectbox("Model", ["llama-3.3-70b-versatile", "llama-3.3-70b", "openai/gpt-oss-120b"], index=0)
-    top_k = st.slider("Top K Chunks", 1, 12, 4)
-    similarity_threshold = st.slider("Similarity Threshold (distance)", 0.0, 1.0, 0.7)
-    debug_checkbox = st.checkbox("Show more debug info", False)
     
-    # Embedding method selection
-    embedding_method = st.selectbox(
-        "Embedding Method",
-        ["HuggingFace (Local)", "OpenAI (API)"],
-        index=0,
-        help="HuggingFace uses local models, OpenAI requires API key"
+    # API Keys
+    groq_api_key = st.text_input("Groq API Key", type="password", value=os.getenv("GROQ_API_KEY", ""))
+    openai_api_key = st.text_input("OpenAI API Key (for embeddings)", type="password", value=os.getenv("OPENAI_API_KEY", ""))
+    
+    model_choice = st.selectbox("Groq Model", ["llama-3.3-70b-versatile", "llama-3.3-70b", "mixtral-8x7b-32768"], index=0)
+    top_k = st.slider("Top K Chunks", 1, 12, 4)
+    similarity_threshold = st.slider("Similarity Threshold", 0.0, 1.0, 0.7)
+    
+    # Embedding model selection
+    embedding_model = st.selectbox(
+        "Embedding Model",
+        ["text-embedding-3-small", "text-embedding-3-large", "text-embedding-ada-002"],
+        index=0
     )
     
-    if embedding_method == "OpenAI (API)":
-        openai_api_key = st.text_input("OpenAI API Key", type="password")
-    else:
-        openai_api_key = None
+    debug_checkbox = st.checkbox("Show more debug info", False)
     
     if st.button("🧹 Cleanup Vector Store (this session)"):
-        # remove vectorstore for session
         idx_dir = os.path.join(session_dir(session_id), "chroma_index")
         if os.path.exists(idx_dir):
             shutil.rmtree(idx_dir, ignore_errors=True)
@@ -138,16 +132,19 @@ with st.sidebar:
 if debug_checkbox:
     DEBUG = True
 
-# Use API key provided or from .env
-api_key = api_key_input or os.getenv("GROQ_API_KEY")
-if not api_key:
-    st.warning("⚠️ Please enter your Groq API key in the sidebar or in a .env file.")
+# Validate API keys
+if not groq_api_key:
+    st.warning("⚠️ Please enter your Groq API key in the sidebar or set GROQ_API_KEY in environment variables.")
+    st.stop()
+
+if not openai_api_key:
+    st.warning("⚠️ Please enter your OpenAI API key for embeddings in the sidebar or set OPENAI_API_KEY in environment variables.")
     st.stop()
 
 # Initialize LLM
 try:
     llm = ChatGroq(
-        groq_api_key=api_key,
+        groq_api_key=groq_api_key,
         model_name=model_choice,
         temperature=0.1
     )
@@ -156,44 +153,34 @@ except Exception as e:
     st.stop()
 
 # -----------------------------
-# Embeddings setup with fallback
+# Embeddings setup
 # -----------------------------
 @st.cache_resource(show_spinner=False)
-def get_embeddings(_method="HuggingFace (Local)", _openai_key=None):
-    if _method == "OpenAI (API)" and _openai_key:
-        try:
-            from langchain_openai import OpenAIEmbeddings
-            return OpenAIEmbeddings(openai_api_key=_openai_key)
-        except Exception as e:
-            st.warning(f"OpenAI embeddings failed: {e}. Falling back to HuggingFace.")
+def get_embeddings(api_key, model_name="text-embedding-3-small"):
+    if not OPENAI_EMBEDDINGS_AVAILABLE:
+        st.error("OpenAI embeddings not available. Please install langchain-openai.")
+        return None
     
-    # Fallback to HuggingFace
     try:
-        from langchain_community.embeddings import HuggingFaceEmbeddings
-        # Use a simpler, more compatible model
-        return HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2",
-            model_kwargs={'device': 'cpu'},  # Force CPU for compatibility
-            encode_kwargs={'normalize_embeddings': False}
+        return OpenAIEmbeddings(
+            openai_api_key=api_key,
+            model=model_name
         )
     except Exception as e:
-        st.error(f"Failed to initialize embeddings: {e}")
-        # Ultimate fallback - use a dummy embeddings (not recommended for production)
-        st.warning("Using dummy embeddings as last resort. This is not suitable for production.")
-        from langchain_community.embeddings import FakeEmbeddings
-        return FakeEmbeddings(size=384)
+        st.error(f"Failed to initialize OpenAI embeddings: {e}")
+        return None
 
-try:
-    embeddings = get_embeddings(embedding_method, openai_api_key)
-except Exception as e:
-    st.error(f"Embeddings initialization error: {e}")
-    st.stop()
+with st.spinner("Initializing embeddings..."):
+    embeddings = get_embeddings(openai_api_key, embedding_model)
+    if embeddings is None:
+        st.stop()
 
 # -----------------------------
 # File upload (PDF, txt, docx)
 # -----------------------------
 st.header("📤 Upload documents (PDF / TXT / DOCX)")
 uploaded_files = st.file_uploader("Upload files", type=["pdf", "txt", "docx"], accept_multiple_files=True)
+
 if not uploaded_files:
     st.info("Upload one or more files to begin. You can also drag multiple files.")
     # Load previous chat history and show quick actions if available
@@ -205,25 +192,24 @@ if not uploaded_files:
     st.stop()
 
 # -----------------------------
-# Temporary save uploaded files and load docs
+# Document loading
 # -----------------------------
-# Document loader: prefer PyMuPDFLoader; fallback to PyPDFLoader
 try:
-    from langchain_community.document_loaders import PyMuPDFLoader as PDFLoader
+    from langchain_community.document_loaders import PyPDFLoader
+    PDF_LOADER_AVAILABLE = True
 except Exception:
-    try:
-        from langchain_community.document_loaders import PyPDFLoader as PDFLoader
-    except Exception:
-        PDFLoader = None
+    PDF_LOADER_AVAILABLE = False
 
 from langchain_core.documents import Document
 
 all_docs = []
 tmp_paths = []
+
 with st.spinner("Processing uploaded files..."):
     for f in uploaded_files:
         name = f.name
         suffix = os.path.splitext(name)[1].lower()
+        
         # Save to temp file
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(f.getvalue())
@@ -232,31 +218,44 @@ with st.spinner("Processing uploaded files..."):
 
         try:
             if suffix == ".pdf":
-                if PDFLoader is None:
-                    st.error("PDF processing is not available. Please install PyMuPDF or PyPDF2.")
-                    continue
-                loader = PDFLoader(tmp_name)
-                docs = loader.load()
+                if not PDF_LOADER_AVAILABLE:
+                    # Fallback: use basic text extraction
+                    import PyPDF2
+                    with open(tmp_name, 'rb') as file:
+                        pdf_reader = PyPDF2.PdfReader(file)
+                        text = ""
+                        for page in pdf_reader.pages:
+                            text += page.extract_text() + "\n"
+                        docs = [Document(page_content=text, metadata={"source_file": name})]
+                else:
+                    loader = PyPDFLoader(tmp_name)
+                    docs = loader.load()
+                    
             elif suffix == ".txt":
-                text = open(tmp_name, "r", encoding="utf-8", errors="ignore").read()
+                with open(tmp_name, "r", encoding="utf-8", errors="ignore") as file:
+                    text = file.read()
                 docs = [Document(page_content=text, metadata={"source_file": name})]
+                
             elif suffix == ".docx" and DOCX_AVAILABLE:
                 doc = docx.Document(tmp_name)
-                full = "\n".join([p.text for p in doc.paragraphs])
-                docs = [Document(page_content=full, metadata={"source_file": name})]
+                full_text = "\n".join([p.text for p in doc.paragraphs])
+                docs = [Document(page_content=full_text, metadata={"source_file": name})]
+                
             else:
-                # fallback: plain read
-                text = open(tmp_name, "r", encoding="utf-8", errors="ignore").read()
+                # Fallback for unknown types
+                with open(tmp_name, "r", encoding="utf-8", errors="ignore") as file:
+                    text = file.read()
                 docs = [Document(page_content=text, metadata={"source_file": name})]
 
-            # ensure metadata tags
+            # Add metadata
             for d in docs:
                 d.metadata["source_file"] = name
             all_docs.extend(docs)
+            
         except Exception as e:
             st.error(f"Failed to load {name}: {e}")
 
-# cleanup temp files
+# Cleanup temp files
 for p in tmp_paths:
     try:
         os.unlink(p)
@@ -277,64 +276,58 @@ splits = splitter.split_documents(all_docs)
 st.info(f"📄 Created {len(splits)} text chunks.")
 
 # -----------------------------
-# Vectorstore (persist per-session)
+# Vectorstore setup
 # -----------------------------
 INDEX_DIR = os.path.join(session_dir(session_id), "chroma_index")
 
 @st.cache_resource(show_spinner=False)
 def init_vectorstore(_splits, _embeddings, persist_dir):
     if not CHROMA_AVAILABLE:
-        st.error("Chroma vectorstore is not available. Please check dependencies.")
+        st.error("Chroma vectorstore is not available.")
         return None
         
-    # remove previous chroma in this session to avoid stale corruption
     try:
-        vs = Chroma.from_documents(_splits, _embeddings, persist_directory=persist_dir)
+        # Clean previous index
+        if os.path.exists(persist_dir):
+            shutil.rmtree(persist_dir, ignore_errors=True)
+            
+        vs = Chroma.from_documents(
+            documents=_splits,
+            embedding=_embeddings,
+            persist_directory=persist_dir
+        )
         return vs
     except Exception as e:
-        # attempt to cleanup then recreate
-        try:
-            if os.path.exists(persist_dir):
-                shutil.rmtree(persist_dir, ignore_errors=True)
-            vs = Chroma.from_documents(_splits, _embeddings, persist_directory=persist_dir)
-            return vs
-        except Exception as e2:
-            st.error(f"Failed to init Chroma vectorstore: {e2}")
-            return None
+        st.error(f"Failed to initialize vector store: {e}")
+        return None
 
-with st.spinner("Initializing vector store..."):
-    try:
-        vectorstore = init_vectorstore(splits, embeddings, INDEX_DIR)
-        if vectorstore is None:
-            st.error("Failed to initialize vector store. Check the logs for details.")
-            st.stop()
-    except Exception as e:
-        st.error(f"Vectorstore initialization error: {e}")
+with st.spinner("Building vector store..."):
+    vectorstore = init_vectorstore(splits, embeddings, INDEX_DIR)
+    if vectorstore is None:
         st.stop()
 
 st.session_state.vectorstore_initialized = True
 
 # -----------------------------
-# Retriever with threshold filtering
+# Retriever
 # -----------------------------
 def create_retriever(vs, k=5, distance_threshold=0.7):
     def retrieve(question):
         try:
             docs_with_scores = vs.similarity_search_with_score(question, k=k*3)
-            # docs_with_scores -> list of (doc, distance)
             filtered = [d for d, dist in docs_with_scores if dist <= distance_threshold]
             if not filtered:
                 filtered = [d for d, _ in docs_with_scores[:k]]
             return filtered[:k]
         except Exception as e:
-            debug_log(f"Retriever internal error: {e}")
+            debug_log(f"Retriever error: {e}")
             return vs.similarity_search(question, k=k)
     return retrieve
 
 retriever = create_retriever(vectorstore, k=top_k, distance_threshold=similarity_threshold)
 
 # -----------------------------
-# RAG chain definition
+# RAG chain
 # -----------------------------
 def rag_chain(question, chat_history_messages):
     start_time = time.time()
@@ -343,6 +336,7 @@ def rag_chain(question, chat_history_messages):
         return "⚠️ No relevant text found in your documents.", [], 0.0
 
     context = "\n\n".join([d.page_content for d in docs])
+    
     qa_prompt = ChatPromptTemplate.from_messages([
         ("system",
          "You are a helpful assistant. Answer based **only** on the provided context.\n"
@@ -351,60 +345,21 @@ def rag_chain(question, chat_history_messages):
         ("human", "Question: {question}")
     ])
 
-    # chain style: create prompt, call llm
     chain = qa_prompt | llm | StrOutputParser()
     try:
         response = chain.invoke({"context": context, "question": question})
     except Exception as e:
         response = f"Error generating response: {e}"
+    
     duration = round(time.time() - start_time, 2)
     return response, docs, duration
 
 # -----------------------------
-# Insights & clustering
-# -----------------------------
-def generate_document_summary(llm, docs, max_chars=4000):
-    # join some content and ask model for short summary
-    preview = "\n\n".join([d.page_content[:1000] for d in docs[:10]])
-    if len(preview) > max_chars:
-        preview = preview[:max_chars]
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are a helpful assistant summarizer."),
-        ("human", f"Summarize the following documents into a concise set of bullet points (max 6 bullets). Text:\n\n{preview}")
-    ])
-    chain = prompt | llm | StrOutputParser()
-    try:
-        return chain.invoke({})
-    except Exception as e:
-        return f"Unable to generate summary: {e}"
-
-def cluster_chunks(_embeddings, chunks, n_clusters=4):
-    if not SKLEARN_AVAILABLE:
-        return None
-    try:
-        # Use a simpler approach to avoid complex dependencies
-        embs = [_embeddings.embed_query(c.page_content) for c in chunks[:50]]  # Limit for performance
-        import numpy as np
-        em = np.array(embs)
-        kmeans = KMeans(n_clusters=min(n_clusters, len(em)), random_state=0).fit(em)
-        clusters = {}
-        for idx, label in enumerate(kmeans.labels_):
-            clusters.setdefault(int(label), []).append(chunks[idx])
-        return clusters
-    except Exception as e:
-        debug_log(f"Clustering failed: {e}")
-        return None
-
-# -----------------------------
-# Chat UI & interaction
+# Chat UI
 # -----------------------------
 if "messages" not in st.session_state:
-    # load saved chat history by session id if present
     previous = load_chat_history(session_id)
-    if previous:
-        st.session_state.messages = previous
-    else:
-        st.session_state.messages = []
+    st.session_state.messages = previous if previous else []
 
 if "chathistory" not in st.session_state:
     st.session_state.chathistory = {}
@@ -414,40 +369,23 @@ def get_chat_history_obj(sid):
         st.session_state.chathistory[sid] = ChatMessageHistory()
     return st.session_state.chathistory[sid]
 
-# Display existing messages
+# Display chat messages
 st.header("💬 Chat with your documents")
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-# Show insights block (collapsible)
+# Document insights
 with st.expander("🔎 Document Insights"):
     st.write(f"**Files uploaded:** {', '.join({d.metadata.get('source_file','?') for d in all_docs})}")
-    st.write(f"**Total raw pages/chunks:** {len(all_docs)}")
-    st.write(f"**Chunks created:** {len(splits)}")
-    if st.button("🧾 Generate quick summary (using model)"):
-        with st.spinner("Generating summary..."):
-            summary = generate_document_summary(llm, all_docs)
-            st.markdown(summary)
-
-    if SKLEARN_AVAILABLE:
-        if st.button("📂 Try topic clustering of chunks"):
-            with st.spinner("Clustering chunks..."):
-                clusters = cluster_chunks(embeddings, splits, n_clusters=4)
-                if clusters:
-                    for k, items in clusters.items():
-                        st.markdown(f"**Cluster {k} — {len(items)} chunks**")
-                        st.write(items[0].page_content[:300] + "...")
-                else:
-                    st.info("Clustering did not produce results.")
-    else:
-        st.info("Topic clustering requires scikit-learn (`pip install scikit-learn`).")
+    st.write(f"**Total pages/chunks:** {len(all_docs)}")
+    st.write(f"**Text chunks created:** {len(splits)}")
 
 # Chat input
 user_q = st.chat_input("Ask something about your uploaded documents...")
 
 if user_q:
-    # Add user message to UI & history
+    # Add user message
     history_obj = get_chat_history_obj(session_id)
     with st.chat_message("user"):
         st.markdown(user_q)
@@ -456,46 +394,37 @@ if user_q:
 
     # Generate response
     with st.chat_message("assistant"):
-        with st.spinner("Analyzing documents and generating answer..."):
+        with st.spinner("Analyzing documents..."):
             try:
                 response, docs, duration = rag_chain(user_q, history_obj)
                 st.markdown(response)
-                st.caption(f"⏱️ Answer generated in {duration} seconds")
+                st.caption(f"⏱️ Generated in {duration}s")
 
-                # Source display
+                # Show sources
                 if docs:
-                    with st.expander("📂 Sources Used (click to expand)"):
+                    with st.expander("📂 Sources Used"):
                         for d in docs:
-                            src = d.metadata.get("source_file", "Unknown File")
-                            st.markdown(f"**📄 {src}** — Preview:")
-                            # highlight small context: we simply show snippet with user's query bolded
-                            snippet = d.page_content[:800]
-                            # naive highlight: replace occurrences (case-insensitive)
-                            try:
-                                import re
-                                pattern = re.compile(re.escape(user_q[:60]), re.IGNORECASE)
-                                snippet = pattern.sub(lambda m: f"**{m.group(0)}**", snippet)
-                            except Exception:
-                                pass
-                            st.write(snippet + "...")
+                            src = d.metadata.get("source_file", "Unknown")
+                            st.markdown(f"**📄 {src}**")
+                            snippet = d.page_content[:500] + "..."
+                            st.write(snippet)
                             st.divider()
 
-                # Save assistant message
+                # Save messages
                 st.session_state.messages.append({"role": "assistant", "content": response})
                 history_obj.add_ai_message(response)
-                # persist chat to file
                 save_chat_history(session_id, st.session_state.messages)
 
             except Exception as e:
-                err = f"Error while generating response: {e}"
+                err = f"Error: {e}"
                 st.error(err)
                 st.session_state.messages.append({"role": "assistant", "content": err})
                 save_chat_history(session_id, st.session_state.messages)
 
 # -----------------------------
-# Chat export / download
+# Export tools
 # -----------------------------
-st.header("📥 Export / Session Tools")
+st.header("📥 Export Tools")
 col1, col2, col3 = st.columns(3)
 
 with col1:
@@ -509,34 +438,17 @@ with col2:
         st.download_button("Download JSON", data=chat_json, file_name=f"chat_{session_id}.json", mime="application/json")
 
 with col3:
-    if st.button("🗑️ Clear current chat (session)"):
+    if st.button("🗑️ Clear current chat"):
         st.session_state.messages = []
-        # remove persisted file
         p = chat_history_path(session_id)
         if os.path.exists(p):
             os.remove(p)
         st.rerun()
 
 # -----------------------------
-# Admin & diagnostics
-# -----------------------------
-with st.expander("📊 Admin / Diagnostics"):
-    st.write(f"Vectorstore directory: {INDEX_DIR}")
-    try:
-        idx_exists = os.path.exists(INDEX_DIR)
-        st.write(f"Vectorstore exists: {idx_exists}")
-    except Exception:
-        pass
-    st.write(f"Documents loaded: {len(all_docs)}")
-    st.write(f"Chunks: {len(splits)}")
-    st.write(f"Session ID: {session_id}")
-    st.write(f"Embedding method: {embedding_method}")
-
-# -----------------------------
-# Atexit cleanup safety (optional)
+# Cleanup
 # -----------------------------
 def cleanup_vectorstore_on_exit():
-    # Do NOT auto-delete — we persist per session. This function kept for manual use.
-    debug_log("Exiting app. If you want to cleanup vectorstores, use the sidebar button.")
+    debug_log("App exiting - vector stores preserved.")
 
 atexit.register(cleanup_vectorstore_on_exit)

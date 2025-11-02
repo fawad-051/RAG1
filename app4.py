@@ -1,11 +1,14 @@
-# app3.py  -- Advanced RAG Q&A (upgraded)
+# app4.py  -- Advanced RAG Q&A (fixed for Streamlit deployment)
 # Requirements (suggested):
 # pip install streamlit langchain-groq langchain_core langchain_community langchain_text_splitters langchain_chroma sentence-transformers scikit-learn python-docx python-dotenv
 
 import os
-os.environ["USE_TF"] = "0"
+
+# ✅ Disable TensorFlow and Flax in transformers to prevent import errors
 os.environ["TRANSFORMERS_NO_TF"] = "1"
-os.environ["TRANSFORMERS_NO_TORCH"] = "0"
+os.environ["TRANSFORMERS_NO_FLAX"] = "1"
+os.environ["TRANSFORMERS_NO_PYTORCH"] = "0"
+
 import tempfile
 import streamlit as st
 import time
@@ -471,4 +474,5 @@ def cleanup_vectorstore_on_exit():
     debug_log("Exiting app. If you want to cleanup vectorstores, use the sidebar button.")
 
 atexit.register(cleanup_vectorstore_on_exit)
+
 

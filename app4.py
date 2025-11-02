@@ -18,7 +18,6 @@ from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_community.chat_message_histories import ChatMessageHistory
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.output_parsers import StrOutputParser
 
 # Use OpenAI embeddings instead of sentence-transformers
@@ -62,6 +61,67 @@ DEBUG = st.sidebar.checkbox("Debug mode (console logs)", False)
 def debug_log(msg):
     if DEBUG:
         print("DEBUG:", msg)
+
+# -----------------------------
+# Custom Text Splitter to avoid sentence-transformers import issues
+# -----------------------------
+class SimpleTextSplitter:
+    def __init__(self, chunk_size=800, chunk_overlap=120):
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+    
+    def split_text(self, text):
+        """Simple text splitter that splits by paragraphs and then by chunk size"""
+        paragraphs = text.split('\n\n')
+        chunks = []
+        
+        for paragraph in paragraphs:
+            if len(paragraph) <= self.chunk_size:
+                chunks.append(paragraph)
+            else:
+                # Split long paragraphs by sentence endings
+                sentences = []
+                current_sentence = ""
+                
+                for char in paragraph:
+                    current_sentence += char
+                    if char in ['.', '!', '?'] and len(current_sentence) > 50:
+                        sentences.append(current_sentence.strip())
+                        current_sentence = ""
+                
+                if current_sentence:
+                    sentences.append(current_sentence.strip())
+                
+                # Group sentences into chunks
+                current_chunk = ""
+                for sentence in sentences:
+                    if len(current_chunk) + len(sentence) + 1 <= self.chunk_size:
+                        if current_chunk:
+                            current_chunk += " " + sentence
+                        else:
+                            current_chunk = sentence
+                    else:
+                        if current_chunk:
+                            chunks.append(current_chunk)
+                        current_chunk = sentence
+                
+                if current_chunk:
+                    chunks.append(current_chunk)
+        
+        return chunks
+    
+    def split_documents(self, documents):
+        """Split a list of documents"""
+        all_chunks = []
+        for doc in documents:
+            text_chunks = self.split_text(doc.page_content)
+            for i, chunk in enumerate(text_chunks):
+                new_doc = doc.copy()
+                new_doc.page_content = chunk
+                if 'chunk' not in new_doc.metadata:
+                    new_doc.metadata['chunk'] = i
+                all_chunks.append(new_doc)
+        return all_chunks
 
 # -----------------------------
 # Session & storage helpers
@@ -269,9 +329,9 @@ if not all_docs:
 st.success(f"✅ Loaded {len(all_docs)} pages/chunks from {len(uploaded_files)} file(s)")
 
 # -----------------------------
-# Split into chunks
+# Split into chunks using custom splitter
 # -----------------------------
-splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=120)
+splitter = SimpleTextSplitter(chunk_size=800, chunk_overlap=120)
 splits = splitter.split_documents(all_docs)
 st.info(f"📄 Created {len(splits)} text chunks.")
 

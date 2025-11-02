@@ -1,14 +1,8 @@
-# app4.py  -- Advanced RAG Q&A (fixed for Streamlit deployment)
+# app4.py  -- Advanced RAG Q&A (upgraded)
 # Requirements (suggested):
-# pip install streamlit langchain-groq langchain_core langchain_community langchain_text_splitters langchain_chroma sentence-transformers scikit-learn python-docx python-dotenv
+# pip install streamlit langchain-groq langchain-core langchain-community langchain-text-splitters langchain-chroma sentence-transformers==2.2.2 scikit-learn python-docx python-dotenv
 
 import os
-
-# ✅ Disable TensorFlow and Flax in transformers to prevent import errors
-os.environ["TRANSFORMERS_NO_TF"] = "1"
-os.environ["TRANSFORMERS_NO_FLAX"] = "1"
-os.environ["TRANSFORMERS_NO_PYTORCH"] = "0"
-
 import tempfile
 import streamlit as st
 import time
@@ -25,8 +19,23 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
+
+# Try different embedding approaches
+try:
+    # First try: use HuggingFaceEmbeddings with a simpler model
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+    EMBEDDINGS_AVAILABLE = True
+except Exception as e:
+    st.warning(f"HuggingFaceEmbeddings not available: {e}")
+    EMBEDDINGS_AVAILABLE = False
+
+try:
+    from langchain_chroma import Chroma
+    CHROMA_AVAILABLE = True
+except Exception as e:
+    st.warning(f"Chroma not available: {e}")
+    CHROMA_AVAILABLE = False
+
 from langchain_core.output_parsers import StrOutputParser
 
 # Optional imports
@@ -102,6 +111,20 @@ with st.sidebar:
     top_k = st.slider("Top K Chunks", 1, 12, 4)
     similarity_threshold = st.slider("Similarity Threshold (distance)", 0.0, 1.0, 0.7)
     debug_checkbox = st.checkbox("Show more debug info", False)
+    
+    # Embedding method selection
+    embedding_method = st.selectbox(
+        "Embedding Method",
+        ["HuggingFace (Local)", "OpenAI (API)"],
+        index=0,
+        help="HuggingFace uses local models, OpenAI requires API key"
+    )
+    
+    if embedding_method == "OpenAI (API)":
+        openai_api_key = st.text_input("OpenAI API Key", type="password")
+    else:
+        openai_api_key = None
+    
     if st.button("🧹 Cleanup Vector Store (this session)"):
         # remove vectorstore for session
         idx_dir = os.path.join(session_dir(session_id), "chroma_index")
@@ -133,6 +156,40 @@ except Exception as e:
     st.stop()
 
 # -----------------------------
+# Embeddings setup with fallback
+# -----------------------------
+@st.cache_resource(show_spinner=False)
+def get_embeddings(_method="HuggingFace (Local)", _openai_key=None):
+    if _method == "OpenAI (API)" and _openai_key:
+        try:
+            from langchain_openai import OpenAIEmbeddings
+            return OpenAIEmbeddings(openai_api_key=_openai_key)
+        except Exception as e:
+            st.warning(f"OpenAI embeddings failed: {e}. Falling back to HuggingFace.")
+    
+    # Fallback to HuggingFace
+    try:
+        from langchain_community.embeddings import HuggingFaceEmbeddings
+        # Use a simpler, more compatible model
+        return HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            model_kwargs={'device': 'cpu'},  # Force CPU for compatibility
+            encode_kwargs={'normalize_embeddings': False}
+        )
+    except Exception as e:
+        st.error(f"Failed to initialize embeddings: {e}")
+        # Ultimate fallback - use a dummy embeddings (not recommended for production)
+        st.warning("Using dummy embeddings as last resort. This is not suitable for production.")
+        from langchain_community.embeddings import FakeEmbeddings
+        return FakeEmbeddings(size=384)
+
+try:
+    embeddings = get_embeddings(embedding_method, openai_api_key)
+except Exception as e:
+    st.error(f"Embeddings initialization error: {e}")
+    st.stop()
+
+# -----------------------------
 # File upload (PDF, txt, docx)
 # -----------------------------
 st.header("📤 Upload documents (PDF / TXT / DOCX)")
@@ -154,10 +211,12 @@ if not uploaded_files:
 try:
     from langchain_community.document_loaders import PyMuPDFLoader as PDFLoader
 except Exception:
-    from langchain_community.document_loaders import PyPDFLoader as PDFLoader
+    try:
+        from langchain_community.document_loaders import PyPDFLoader as PDFLoader
+    except Exception:
+        PDFLoader = None
 
 from langchain_core.documents import Document
-
 
 all_docs = []
 tmp_paths = []
@@ -173,6 +232,9 @@ with st.spinner("Processing uploaded files..."):
 
         try:
             if suffix == ".pdf":
+                if PDFLoader is None:
+                    st.error("PDF processing is not available. Please install PyMuPDF or PyPDF2.")
+                    continue
                 loader = PDFLoader(tmp_name)
                 docs = loader.load()
             elif suffix == ".txt":
@@ -215,20 +277,16 @@ splits = splitter.split_documents(all_docs)
 st.info(f"📄 Created {len(splits)} text chunks.")
 
 # -----------------------------
-# Embeddings (cache)
-# -----------------------------
-@st.cache_resource(show_spinner=False)
-def get_embeddings():
-    return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-
-embeddings = get_embeddings()
-
-# -----------------------------
 # Vectorstore (persist per-session)
 # -----------------------------
 INDEX_DIR = os.path.join(session_dir(session_id), "chroma_index")
+
 @st.cache_resource(show_spinner=False)
 def init_vectorstore(_splits, _embeddings, persist_dir):
+    if not CHROMA_AVAILABLE:
+        st.error("Chroma vectorstore is not available. Please check dependencies.")
+        return None
+        
     # remove previous chroma in this session to avoid stale corruption
     try:
         vs = Chroma.from_documents(_splits, _embeddings, persist_directory=persist_dir)
@@ -241,11 +299,15 @@ def init_vectorstore(_splits, _embeddings, persist_dir):
             vs = Chroma.from_documents(_splits, _embeddings, persist_directory=persist_dir)
             return vs
         except Exception as e2:
-            raise RuntimeError(f"Failed to init Chroma vectorstore: {e2}")
+            st.error(f"Failed to init Chroma vectorstore: {e2}")
+            return None
 
 with st.spinner("Initializing vector store..."):
     try:
         vectorstore = init_vectorstore(splits, embeddings, INDEX_DIR)
+        if vectorstore is None:
+            st.error("Failed to initialize vector store. Check the logs for details.")
+            st.stop()
     except Exception as e:
         st.error(f"Vectorstore initialization error: {e}")
         st.stop()
@@ -304,6 +366,8 @@ def rag_chain(question, chat_history_messages):
 def generate_document_summary(llm, docs, max_chars=4000):
     # join some content and ask model for short summary
     preview = "\n\n".join([d.page_content[:1000] for d in docs[:10]])
+    if len(preview) > max_chars:
+        preview = preview[:max_chars]
     prompt = ChatPromptTemplate.from_messages([
         ("system", "You are a helpful assistant summarizer."),
         ("human", f"Summarize the following documents into a concise set of bullet points (max 6 bullets). Text:\n\n{preview}")
@@ -314,14 +378,15 @@ def generate_document_summary(llm, docs, max_chars=4000):
     except Exception as e:
         return f"Unable to generate summary: {e}"
 
-def cluster_chunks(embeddings, chunks, n_clusters=4):
+def cluster_chunks(_embeddings, chunks, n_clusters=4):
     if not SKLEARN_AVAILABLE:
         return None
     try:
-        embs = [embeddings.embed_query(c.page_content) for c in chunks]
+        # Use a simpler approach to avoid complex dependencies
+        embs = [_embeddings.embed_query(c.page_content) for c in chunks[:50]]  # Limit for performance
         import numpy as np
         em = np.array(embs)
-        kmeans = KMeans(n_clusters=min(n_clusters, len(chunks)), random_state=0).fit(em)
+        kmeans = KMeans(n_clusters=min(n_clusters, len(em)), random_state=0).fit(em)
         clusters = {}
         for idx, label in enumerate(kmeans.labels_):
             clusters.setdefault(int(label), []).append(chunks[idx])
@@ -450,7 +515,7 @@ with col3:
         p = chat_history_path(session_id)
         if os.path.exists(p):
             os.remove(p)
-        st.experimental_rerun()
+        st.rerun()
 
 # -----------------------------
 # Admin & diagnostics
@@ -465,6 +530,7 @@ with st.expander("📊 Admin / Diagnostics"):
     st.write(f"Documents loaded: {len(all_docs)}")
     st.write(f"Chunks: {len(splits)}")
     st.write(f"Session ID: {session_id}")
+    st.write(f"Embedding method: {embedding_method}")
 
 # -----------------------------
 # Atexit cleanup safety (optional)
@@ -474,5 +540,3 @@ def cleanup_vectorstore_on_exit():
     debug_log("Exiting app. If you want to cleanup vectorstores, use the sidebar button.")
 
 atexit.register(cleanup_vectorstore_on_exit)
-
-

@@ -1,6 +1,6 @@
 # app4.py  -- Advanced RAG Q&A (deployment friendly)
 # Requirements:
-# pip install streamlit langchain-groq langchain-core langchain-community langchain-text-splitters langchain-chroma scikit-learn python-docx python-dotenv pymupdf
+# pip install streamlit langchain-groq langchain-core langchain-community python-docx python-dotenv pymupdf chromadb tiktoken
 
 import os
 import tempfile
@@ -13,40 +13,7 @@ import json
 from datetime import datetime
 from dotenv import load_dotenv
 
-# LangChain imports
-from langchain_groq import ChatGroq
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.messages import HumanMessage, AIMessage
-from langchain_community.chat_message_histories import ChatMessageHistory
-from langchain_core.output_parsers import StrOutputParser
-
-# Use OpenAI embeddings instead of sentence-transformers
-try:
-    from langchain_openai import OpenAIEmbeddings
-    OPENAI_EMBEDDINGS_AVAILABLE = True
-except Exception:
-    OPENAI_EMBEDDINGS_AVAILABLE = False
-
-try:
-    from langchain_chroma import Chroma
-    CHROMA_AVAILABLE = True
-except Exception:
-    CHROMA_AVAILABLE = False
-
-# Optional imports
-try:
-    from sklearn.cluster import KMeans
-    SKLEARN_AVAILABLE = True
-except Exception:
-    SKLEARN_AVAILABLE = False
-
-try:
-    import docx
-    DOCX_AVAILABLE = True
-except Exception:
-    DOCX_AVAILABLE = False
-
-# Load environment variables
+# Load environment variables first
 load_dotenv()
 
 # -----------------------------
@@ -63,7 +30,60 @@ def debug_log(msg):
         print("DEBUG:", msg)
 
 # -----------------------------
-# Custom Text Splitter to avoid sentence-transformers import issues
+# Import with error handling
+# -----------------------------
+try:
+    from langchain_groq import ChatGroq
+    LANGCHAIN_GROQ_AVAILABLE = True
+except ImportError as e:
+    st.error(f"Failed to import LangChain Groq: {e}")
+    LANGCHAIN_GROQ_AVAILABLE = False
+
+try:
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_core.messages import HumanMessage, AIMessage
+    from langchain_core.output_parsers import StrOutputParser
+    from langchain_core.documents import Document
+    LANGCHAIN_CORE_AVAILABLE = True
+except ImportError as e:
+    st.error(f"Failed to import LangChain core: {e}")
+    LANGCHAIN_CORE_AVAILABLE = False
+
+try:
+    from langchain_community.chat_message_histories import ChatMessageHistory
+    LANGCHAIN_COMMUNITY_AVAILABLE = True
+except ImportError:
+    LANGCHAIN_COMMUNITY_AVAILABLE = False
+
+# Use OpenAI embeddings
+try:
+    from langchain_openai import OpenAIEmbeddings
+    OPENAI_EMBEDDINGS_AVAILABLE = True
+except ImportError:
+    OPENAI_EMBEDDINGS_AVAILABLE = False
+
+try:
+    import chromadb
+    from langchain_chroma import Chroma
+    CHROMA_AVAILABLE = True
+except ImportError:
+    CHROMA_AVAILABLE = False
+
+# Optional imports
+try:
+    import docx
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
+
+try:
+    import PyPDF2
+    PYPDF2_AVAILABLE = True
+except ImportError:
+    PYPDF2_AVAILABLE = False
+
+# -----------------------------
+# Custom Text Splitter
 # -----------------------------
 class SimpleTextSplitter:
     def __init__(self, chunk_size=800, chunk_overlap=120):
@@ -72,14 +92,18 @@ class SimpleTextSplitter:
     
     def split_text(self, text):
         """Simple text splitter that splits by paragraphs and then by chunk size"""
-        paragraphs = text.split('\n\n')
+        if not text.strip():
+            return []
+            
+        # First split by paragraphs
+        paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
         chunks = []
         
         for paragraph in paragraphs:
             if len(paragraph) <= self.chunk_size:
                 chunks.append(paragraph)
             else:
-                # Split long paragraphs by sentence endings
+                # Split long paragraphs by sentences
                 sentences = []
                 current_sentence = ""
                 
@@ -89,8 +113,12 @@ class SimpleTextSplitter:
                         sentences.append(current_sentence.strip())
                         current_sentence = ""
                 
-                if current_sentence:
+                if current_sentence.strip():
                     sentences.append(current_sentence.strip())
+                
+                # If no sentences found, split by length
+                if not sentences:
+                    sentences = [paragraph[i:i+self.chunk_size] for i in range(0, len(paragraph), self.chunk_size)]
                 
                 # Group sentences into chunks
                 current_chunk = ""
@@ -108,7 +136,16 @@ class SimpleTextSplitter:
                 if current_chunk:
                     chunks.append(current_chunk)
         
-        return chunks
+        # Final cleanup - ensure no chunks are too large
+        final_chunks = []
+        for chunk in chunks:
+            if len(chunk) > self.chunk_size:
+                # Split oversized chunks
+                final_chunks.extend([chunk[i:i+self.chunk_size] for i in range(0, len(chunk), self.chunk_size)])
+            else:
+                final_chunks.append(chunk)
+        
+        return final_chunks
     
     def split_documents(self, documents):
         """Split a list of documents"""
@@ -116,10 +153,11 @@ class SimpleTextSplitter:
         for doc in documents:
             text_chunks = self.split_text(doc.page_content)
             for i, chunk in enumerate(text_chunks):
-                new_doc = doc.copy()
-                new_doc.page_content = chunk
-                if 'chunk' not in new_doc.metadata:
-                    new_doc.metadata['chunk'] = i
+                new_doc = Document(
+                    page_content=chunk,
+                    metadata=doc.metadata.copy()
+                )
+                new_doc.metadata['chunk'] = i
                 all_chunks.append(new_doc)
         return all_chunks
 
@@ -192,6 +230,11 @@ with st.sidebar:
 if debug_checkbox:
     DEBUG = True
 
+# Check if all required components are available
+if not all([LANGCHAIN_GROQ_AVAILABLE, LANGCHAIN_CORE_AVAILABLE, OPENAI_EMBEDDINGS_AVAILABLE, CHROMA_AVAILABLE]):
+    st.error("❌ Some required components are not available. Please check the installation.")
+    st.stop()
+
 # Validate API keys
 if not groq_api_key:
     st.warning("⚠️ Please enter your Groq API key in the sidebar or set GROQ_API_KEY in environment variables.")
@@ -217,10 +260,6 @@ except Exception as e:
 # -----------------------------
 @st.cache_resource(show_spinner=False)
 def get_embeddings(api_key, model_name="text-embedding-3-small"):
-    if not OPENAI_EMBEDDINGS_AVAILABLE:
-        st.error("OpenAI embeddings not available. Please install langchain-openai.")
-        return None
-    
     try:
         return OpenAIEmbeddings(
             openai_api_key=api_key,
@@ -254,14 +293,6 @@ if not uploaded_files:
 # -----------------------------
 # Document loading
 # -----------------------------
-try:
-    from langchain_community.document_loaders import PyPDFLoader
-    PDF_LOADER_AVAILABLE = True
-except Exception:
-    PDF_LOADER_AVAILABLE = False
-
-from langchain_core.documents import Document
-
 all_docs = []
 tmp_paths = []
 
@@ -278,18 +309,18 @@ with st.spinner("Processing uploaded files..."):
 
         try:
             if suffix == ".pdf":
-                if not PDF_LOADER_AVAILABLE:
-                    # Fallback: use basic text extraction
-                    import PyPDF2
+                if PYPDF2_AVAILABLE:
                     with open(tmp_name, 'rb') as file:
                         pdf_reader = PyPDF2.PdfReader(file)
                         text = ""
                         for page in pdf_reader.pages:
-                            text += page.extract_text() + "\n"
+                            page_text = page.extract_text()
+                            if page_text:
+                                text += page_text + "\n"
                         docs = [Document(page_content=text, metadata={"source_file": name})]
                 else:
-                    loader = PyPDFLoader(tmp_name)
-                    docs = loader.load()
+                    st.error(f"PyPDF2 not available. Cannot read PDF file: {name}")
+                    continue
                     
             elif suffix == ".txt":
                 with open(tmp_name, "r", encoding="utf-8", errors="ignore") as file:
@@ -298,7 +329,7 @@ with st.spinner("Processing uploaded files..."):
                 
             elif suffix == ".docx" and DOCX_AVAILABLE:
                 doc = docx.Document(tmp_name)
-                full_text = "\n".join([p.text for p in doc.paragraphs])
+                full_text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
                 docs = [Document(page_content=full_text, metadata={"source_file": name})]
                 
             else:
@@ -310,6 +341,7 @@ with st.spinner("Processing uploaded files..."):
             # Add metadata
             for d in docs:
                 d.metadata["source_file"] = name
+                d.metadata["upload_time"] = datetime.now().isoformat()
             all_docs.extend(docs)
             
         except Exception as e:
@@ -342,10 +374,6 @@ INDEX_DIR = os.path.join(session_dir(session_id), "chroma_index")
 
 @st.cache_resource(show_spinner=False)
 def init_vectorstore(_splits, _embeddings, persist_dir):
-    if not CHROMA_AVAILABLE:
-        st.error("Chroma vectorstore is not available.")
-        return None
-        
     try:
         # Clean previous index
         if os.path.exists(persist_dir):
@@ -466,7 +494,7 @@ if user_q:
                         for d in docs:
                             src = d.metadata.get("source_file", "Unknown")
                             st.markdown(f"**📄 {src}**")
-                            snippet = d.page_content[:500] + "..."
+                            snippet = d.page_content[:500] + ("..." if len(d.page_content) > 500 else "")
                             st.write(snippet)
                             st.divider()
 

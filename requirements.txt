@@ -1,11 +1,20 @@
+# --- Core Framework ---
 streamlit
+
+# --- LangChain Ecosystem ---
 langchain-groq
 langchain-core
 langchain-community
 langchain-chroma
 langchain-text-splitters
+
+# --- NLP / Embeddings ---
 sentence-transformers
-torch
+torch  # required for sentence-transformers
+
+# --- Utils / Clustering / File Handling ---
 scikit-learn
 python-docx
 python-dotenv
+tiktoken
+numpy

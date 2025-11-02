@@ -1,15 +1,12 @@
 streamlit
-langchain
+langchain-groq
 langchain-core
 langchain-community
 langchain-text-splitters
 langchain-chroma
-langchain-groq
 langchain-openai
-scikit-learn
 python-docx
 python-dotenv
 pymupdf
 PyPDF2
-tiktoken
-chromadb
+scikit-learn

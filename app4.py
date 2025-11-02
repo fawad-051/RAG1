@@ -3,6 +3,9 @@
 # pip install streamlit langchain-groq langchain_core langchain_community langchain_text_splitters langchain_chroma sentence-transformers scikit-learn python-docx python-dotenv
 
 import os
+os.environ["USE_TF"] = "0"
+os.environ["TRANSFORMERS_NO_TF"] = "1"
+os.environ["TRANSFORMERS_NO_TORCH"] = "0"
 import tempfile
 import streamlit as st
 import time
@@ -468,3 +471,4 @@ def cleanup_vectorstore_on_exit():
     debug_log("Exiting app. If you want to cleanup vectorstores, use the sidebar button.")
 
 atexit.register(cleanup_vectorstore_on_exit)
+

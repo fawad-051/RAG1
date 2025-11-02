@@ -1,22 +1,22 @@
+# --- Core Framework ---
 streamlit
-python-dotenv
-langchain
+
+# --- LangChain Ecosystem ---
+langchain-groq
 langchain-core
 langchain-community
-langchain-text-splitters
 langchain-chroma
-langchain-huggingface
-langchain-groq
-chromadb
+langchain-text-splitters
+
+# --- Embeddings / NLP ---
 sentence-transformers
-pymupdf
-unstructured
-huggingface-hub
-tqdm
+torch  # PyTorch (required by sentence-transformers)
+
+# --- Data / Clustering / Utilities ---
+scikit-learn
+python-docx
+python-dotenv
+
+# --- Optional / Stability ---
+tiktoken
 numpy
-pandas
-torch
-tensorflow
-keras
-pypdf
-unstructured[pdf]
